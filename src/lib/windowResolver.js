@@ -1,6 +1,12 @@
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
 
+// CRS 用 TIMEZONE_OFFSET 切 hourly/daily key 的日期与小时。
+// 默认 UTC+8(北京时间),必须与 CRS 服务端 .env 的 TIMEZONE_OFFSET 完全一致,
+// 否则读到的 key 全是 0(我们查的小时和它写入时拼的小时不一致)。
+const TIMEZONE_OFFSET_HOURS = Number(process.env.TIMEZONE_OFFSET || 8)
+const TIMEZONE_OFFSET_MS = TIMEZONE_OFFSET_HOURS * 3600000
+
 function parseIso(s) {
   if (!s) return null
   const d = new Date(s)
@@ -21,19 +27,33 @@ function resolveSevenDayWindow(accountHash, now = new Date()) {
   return { start, end: now, resetsAt }
 }
 
+// 返回 CRS 时区下 (yyyy-mm-dd, HH) 用于拼 Redis key。
+function dateHourInTz(t) {
+  const tz = new Date(t.getTime() + TIMEZONE_OFFSET_MS)
+  const yyyy = tz.getUTCFullYear()
+  const mm = String(tz.getUTCMonth() + 1).padStart(2, '0')
+  const dd = String(tz.getUTCDate()).padStart(2, '0')
+  const hh = String(tz.getUTCHours()).padStart(2, '0')
+  return { date: `${yyyy}-${mm}-${dd}`, hour: hh }
+}
+
 function iterHourKeys(start, end) {
   const keys = []
-  const t = new Date(start)
-  t.setUTCMinutes(0, 0, 0)
+  // 步进按 CRS 时区的整点对齐:先把 start 落到 tz 整点,再以 UTC 1 小时步进。
+  const tzStart = new Date(start.getTime() + TIMEZONE_OFFSET_MS)
+  tzStart.setUTCMinutes(0, 0, 0)
+  const t = new Date(tzStart.getTime() - TIMEZONE_OFFSET_MS)
   while (t < end) {
-    const yyyy = t.getUTCFullYear()
-    const mm = String(t.getUTCMonth() + 1).padStart(2, '0')
-    const dd = String(t.getUTCDate()).padStart(2, '0')
-    const hh = String(t.getUTCHours()).padStart(2, '0')
-    keys.push({ date: `${yyyy}-${mm}-${dd}`, hour: hh })
+    keys.push(dateHourInTz(t))
     t.setUTCHours(t.getUTCHours() + 1)
   }
   return keys
 }
 
-module.exports = { resolveFiveHourWindow, resolveSevenDayWindow, iterHourKeys }
+module.exports = {
+  resolveFiveHourWindow,
+  resolveSevenDayWindow,
+  iterHourKeys,
+  dateHourInTz,
+  TIMEZONE_OFFSET_HOURS
+}

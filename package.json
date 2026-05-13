@@ -1,0 +1,18 @@
+{
+  "name": "crs-usage-viewer",
+  "version": "0.1.0",
+  "description": "Read-only HTTP viewer for CRS Redis usage data (5h/7d windows per account/key)",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "ioredis": "^5.4.2"
+  }
+}

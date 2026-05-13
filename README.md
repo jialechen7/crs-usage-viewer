@@ -11,9 +11,11 @@
 | GET | `/stats/health` | 存活探针 |
 | GET | `/stats/accounts` | 列出所有 Claude 账号 |
 | GET | `/stats/account/:name` | 按账号名查该账号下所有 key 在 5h/7d 窗口的用量 |
-| GET | `/stats/key/:name` | 按 key 名查该 key 在 5h/7d 窗口的用量 + 占账号份额 |
+| GET | `/stats/key/:identifier` | 按 key 名 **或** 原始 `cr_xxx` token 查该 key 在 5h/7d 窗口的用量 + 占账号份额 |
 
-重名时返回数组(多个匹配元素)。
+`/stats/key/:identifier` 自动识别参数:以 `cr_` 开头按 token 查(需配置 `ENCRYPTION_KEY` 与 CRS 一致),否则按 name 查。重名时返回数组。
+
+> 安全提示:把原始 cr_ token 放在 URL 里会落到 nginx access log / Cloudflare 边缘缓存。仅在受控网络内使用。
 
 窗口边界对齐 Anthropic 计费:
 - 5h 窗口 = `claudeFiveHourResetsAt - 5h` ~ now

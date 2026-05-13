@@ -7,6 +7,7 @@ const {
   round
 } = require('../lib/usageAggregator')
 const { resolveFiveHourWindow, resolveSevenDayWindow } = require('../lib/windowResolver')
+const { looksLikeToken, resolveKeyIdByToken, loadKeyById } = require('../lib/apiKeyResolver')
 
 const router = express.Router()
 
@@ -75,11 +76,30 @@ async function buildWindowReport(keyRow, account, window, windowType) {
   }
 }
 
-router.get('/key/:name', async (req, res) => {
+async function resolveMatches(identifier) {
+  if (looksLikeToken(identifier)) {
+    try {
+      const keyId = await resolveKeyIdByToken(identifier)
+      if (!keyId) return { matches: [], mode: 'token' }
+      const key = await loadKeyById(keyId)
+      return { matches: key ? [key] : [], mode: 'token' }
+    } catch (err) {
+      const e = new Error(`token lookup failed: ${err.message}`)
+      e.status = 500
+      throw e
+    }
+  }
+  return { matches: await findKeysByName(identifier), mode: 'name' }
+}
+
+router.get('/key/:identifier', async (req, res) => {
   try {
-    const matches = await findKeysByName(req.params.name)
+    const { matches, mode } = await resolveMatches(req.params.identifier)
     if (matches.length === 0) {
-      return res.status(404).json({ error: 'api key name not found', name: req.params.name })
+      return res.status(404).json({
+        error: mode === 'token' ? 'api key token not found' : 'api key name not found',
+        lookupMode: mode
+      })
     }
     const now = new Date()
     const reports = []

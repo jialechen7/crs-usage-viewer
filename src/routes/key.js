@@ -8,6 +8,7 @@ const {
 } = require('../lib/usageAggregator')
 const { resolveFiveHourWindow, resolveSevenDayWindow } = require('../lib/windowResolver')
 const { looksLikeToken, resolveKeyIdByToken, loadKeyById } = require('../lib/apiKeyResolver')
+const { summarizeAccount } = require('../lib/accountSerializer')
 
 const router = express.Router()
 
@@ -117,6 +118,7 @@ router.get('/key/:identifier', async (req, res) => {
           accountId,
           accountName: account ? account.name : null
         },
+        account: summarizeAccount(account),
         fiveHour: await buildWindowReport(k, account, fiveHourWindow, 'fiveHour'),
         sevenDay: await buildWindowReport(k, account, sevenDayWindow, 'sevenDay')
       })

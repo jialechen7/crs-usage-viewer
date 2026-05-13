@@ -48,7 +48,7 @@ async function buildAccountReport(account, now) {
       { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, total: 0 }
     )
     for (const item of items) {
-      item.shareOfWindow = totalCost > 0 ? round(item.cost / totalCost, 6) : 0
+      item.shareOfWindow = totalCost > 0 ? round(item.cost / totalCost, 8) : 0
     }
     return { items, totalCost: round(totalCost, 4), totalTokens }
   }

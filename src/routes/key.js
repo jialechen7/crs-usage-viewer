@@ -71,7 +71,7 @@ async function buildWindowReport(keyRow, account, window, windowType) {
     requests: myUsage.requests,
     activeHours: myUsage.activeHours,
     accountTotalCost: round(accountTotal, 4),
-    shareOfAccount: round(share, 6),
+    shareOfAccount: round(share, 8),
     accountUtilization: utilization,
     contributionToUtilization: utilization !== null ? round(utilization * share, 4) : null
   }

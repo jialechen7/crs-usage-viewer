@@ -1,17 +1,16 @@
 const express = require('express')
-const redis = require('../redis')
 
-const router = express.Router()
+// makeHealthRouter(backend) -> GET /health probe for the given backend.
+module.exports = function makeHealthRouter(backend) {
+  const router = express.Router()
 
-router.get('/health', async (req, res) => {
-  let redisStatus = 'unknown'
-  try {
-    const pong = await redis.ping()
-    redisStatus = pong === 'PONG' ? 'connected' : 'unexpected'
-  } catch (err) {
-    redisStatus = `error: ${err.message}`
-  }
-  res.json({ ok: redisStatus === 'connected', redis: redisStatus, ts: new Date().toISOString() })
-})
+  router.get('/health', async (req, res) => {
+    const { ok, detail } = await backend.health()
+    const body = { ok, backend: backend.name, store: detail, ts: new Date().toISOString() }
+    // Backward-compatible alias: the original crs /stats/health exposed `redis`.
+    if (backend.name === 'crs') body.redis = detail
+    res.json(body)
+  })
 
-module.exports = router
+  return router
+}

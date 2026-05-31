@@ -1,12 +1,13 @@
 // crs2 backend: reads crs2 (sub2api) usage from PostgreSQL.
-// sub2api's data model differs from CRS:
-//   - accounts.session_window_* is the Anthropic 5h session window; there is
-//     NO Anthropic utilization percentage, so all utilization fields are null.
-//   - api_keys.key is plaintext (sk-...), so token lookup is a direct equality
-//     match — no sha256/ENCRYPTION_KEY like CRS.
-//   - usage_logs is the canonical per-request source; any window is aggregated
-//     from it. Keys are NOT statically bound to one account.
-// Output field names mirror the crs backend so a single client parses both.
+// sub2api differs from CRS in storage but DOES track upstream utilization in
+// accounts.extra (Anthropic: session_window_utilization / passive_usage_7d_*;
+// OpenAI/Codex: codex_*_used_percent). So crs2 produces the SAME report shape
+// as the crs backend (utilization + per-key share), and a single client renders
+// both. Per-key usage is aggregated from usage_logs.
+//   - api_keys.key is plaintext (sk-...), so token lookup is direct equality.
+//   - A key is not statically bound to one account; its "primary account" is the
+//     one that served the most cost in the trailing window (byAccount keeps the
+//     full breakdown).
 const { query } = require('../pg')
 const { round } = require('../lib/usageAggregator')
 
@@ -15,14 +16,22 @@ const FIVE_HOURS_MS = 5 * 60 * 60 * 1000
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
 
 function iso(d) {
-  return d ? new Date(d).toISOString() : null
+  if (d == null) return null
+  const t = d instanceof Date ? d : new Date(d)
+  return Number.isNaN(t.getTime()) ? null : t.toISOString()
+}
+
+function num(v) {
+  if (v === undefined || v === null || v === '') return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
 }
 
 function emptyTokens() {
   return { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, total: 0 }
 }
 
-// Shared SELECT list so account/key aggregations stay in sync.
+// Shared SELECT list (table aliased u) so account/key aggregations stay in sync.
 const USAGE_SELECT = `
   COALESCE(sum(total_cost), 0)            AS cost,
   COALESCE(sum(input_tokens), 0)          AS input_tokens,
@@ -45,6 +54,71 @@ function rowToUsage(r) {
   }
 }
 
+const ACCOUNT_COLS =
+  'id, name, platform, type, status, schedulable, session_window_start, ' +
+  'session_window_end, session_window_status, last_used_at, updated_at, error_message, extra'
+
+// Normalize the upstream 5h/7d utilization sub2api scrapes into accounts.extra.
+// Anthropic stores fractions (0–1); Codex stores integer percents (0–100).
+// Returns everything already in CRS units: utilization 0–100, resets as ISO.
+function utilFromAccount(a) {
+  const extra = a.extra && typeof a.extra === 'object' ? a.extra : {}
+
+  let fiveUtil = null
+  if (extra.codex_5h_used_percent != null) fiveUtil = num(extra.codex_5h_used_percent)
+  else if (extra.session_window_utilization != null) {
+    const f = num(extra.session_window_utilization)
+    fiveUtil = f == null ? null : round(f * 100, 4)
+  }
+
+  let sevenUtil = null
+  if (extra.codex_7d_used_percent != null) sevenUtil = num(extra.codex_7d_used_percent)
+  else if (extra.passive_usage_7d_utilization != null) {
+    const f = num(extra.passive_usage_7d_utilization)
+    sevenUtil = f == null ? null : round(f * 100, 4)
+  }
+
+  const fiveReset =
+    iso(a.session_window_end) || iso(extra.codex_5h_reset_at) || null
+  let sevenReset = null
+  if (extra.passive_usage_7d_reset != null) {
+    const sec = num(extra.passive_usage_7d_reset)
+    if (sec != null) sevenReset = iso(new Date(sec * 1000))
+  }
+  if (!sevenReset) sevenReset = iso(extra.codex_7d_reset_at)
+
+  const sampledAt =
+    iso(extra.passive_usage_sampled_at) || iso(extra.codex_usage_updated_at) || iso(a.updated_at)
+
+  return {
+    fiveHour: { utilization: fiveUtil, resetsAt: fiveReset },
+    // sub2api has no per-model (Opus) breakdown → opusUtilization stays null.
+    sevenDay: { utilization: sevenUtil, resetsAt: sevenReset, opusUtilization: null, opusResetsAt: null },
+    sampledAt
+  }
+}
+
+// Aggregation windows aligned to the utilization resets so a key's cost share
+// lines up with the utilization the share is multiplied against.
+function accountWindows(a, now) {
+  const u = utilFromAccount(a)
+  const reset5h = u.fiveHour.resetsAt ? new Date(u.fiveHour.resetsAt) : null
+  const reset7d = u.sevenDay.resetsAt ? new Date(u.sevenDay.resetsAt) : null
+  const start5h = a.session_window_start
+    ? new Date(a.session_window_start)
+    : reset5h
+      ? new Date(reset5h.getTime() - FIVE_HOURS_MS)
+      : new Date(now.getTime() - FIVE_HOURS_MS)
+  const start7d = reset7d
+    ? new Date(reset7d.getTime() - SEVEN_DAYS_MS)
+    : new Date(now.getTime() - SEVEN_DAYS_MS)
+  return {
+    util: u,
+    fiveHour: { start: start5h, end: now, resetsAt: u.fiveHour.resetsAt },
+    sevenDay: { start: start7d, end: now, resetsAt: u.sevenDay.resetsAt }
+  }
+}
+
 async function health() {
   try {
     await query('SELECT 1')
@@ -55,6 +129,7 @@ async function health() {
 }
 
 function summarizeAccountRow(a) {
+  const u = utilFromAccount(a)
   return {
     id: String(a.id),
     name: a.name,
@@ -65,24 +140,18 @@ function summarizeAccountRow(a) {
     sessionWindowStatus: a.session_window_status || null,
     sessionWindowStart: iso(a.session_window_start),
     sessionWindowEnd: iso(a.session_window_end),
-    fiveHour: {
-      resetsAt: iso(a.session_window_end),
-      utilization: null
-    },
+    errorMessage: a.error_message || null,
+    fiveHour: { resetsAt: u.fiveHour.resetsAt, utilization: u.fiveHour.utilization },
     sevenDay: {
-      resetsAt: null,
-      utilization: null,
-      opusUtilization: null,
-      opusResetsAt: null
+      resetsAt: u.sevenDay.resetsAt,
+      utilization: u.sevenDay.utilization,
+      opusUtilization: u.sevenDay.opusUtilization,
+      opusResetsAt: u.sevenDay.opusResetsAt
     },
     lastUsedAt: iso(a.last_used_at),
-    usageUpdatedAt: iso(a.updated_at)
+    usageUpdatedAt: u.sampledAt
   }
 }
-
-const ACCOUNT_COLS =
-  'id, name, platform, type, status, schedulable, session_window_start, ' +
-  'session_window_end, session_window_status, last_used_at, updated_at, error_message'
 
 async function listAccounts() {
   const { rows } = await query(
@@ -91,27 +160,7 @@ async function listAccounts() {
   return rows.map(summarizeAccountRow)
 }
 
-// 5h window: anchored on the account's Anthropic session window when present,
-// otherwise a rolling 5h. 7d window: rolling (sub2api has no account-level 7d).
-function accountWindows(accountRow, now) {
-  const start5h = accountRow.session_window_start
-    ? new Date(accountRow.session_window_start)
-    : new Date(now.getTime() - FIVE_HOURS_MS)
-  return {
-    fiveHour: {
-      start: start5h,
-      end: now,
-      resetsAt: accountRow.session_window_end ? new Date(accountRow.session_window_end) : null
-    },
-    sevenDay: {
-      start: new Date(now.getTime() - SEVEN_DAYS_MS),
-      end: now,
-      resetsAt: null
-    }
-  }
-}
-
-async function collectAccountWindow(accountId, window) {
+async function collectAccountWindow(accountId, window, utilization) {
   const { rows } = await query(
     `SELECT u.api_key_id, ${USAGE_SELECT},
             k.name AS key_name, k.status AS key_status
@@ -149,17 +198,16 @@ async function collectAccountWindow(accountId, window) {
   )
   for (const item of items) {
     item.shareOfWindow = totalCost > 0 ? round(item.cost / totalCost, 8) : 0
-    // sub2api has no Anthropic utilization to apportion.
-    item.contributionToUtilization = null
+    item.contributionToUtilization =
+      utilization != null ? round(utilization * item.shareOfWindow, 4) : null
   }
   return { items, totalCost: round(totalCost, 4), totalTokens }
 }
 
 async function buildAccountReport(accountRow, now) {
-  const windows = accountWindows(accountRow, now)
-  const fiveHour = await collectAccountWindow(accountRow.id, windows.fiveHour)
-  const sevenDay = await collectAccountWindow(accountRow.id, windows.sevenDay)
-
+  const w = accountWindows(accountRow, now)
+  const fiveHour = await collectAccountWindow(accountRow.id, w.fiveHour, w.util.fiveHour.utilization)
+  const sevenDay = await collectAccountWindow(accountRow.id, w.sevenDay, w.util.sevenDay.utilization)
   const summary = summarizeAccountRow(accountRow)
 
   return {
@@ -171,24 +219,21 @@ async function buildAccountReport(accountRow, now) {
       status: summary.status,
       sessionWindowStatus: summary.sessionWindowStatus,
       fiveHour: {
-        windowStart: iso(windows.fiveHour.start),
-        windowEnd: iso(windows.fiveHour.end),
-        resetsAt: iso(windows.fiveHour.resetsAt),
-        utilization: null
+        windowStart: iso(w.fiveHour.start),
+        windowEnd: iso(w.fiveHour.end),
+        resetsAt: w.fiveHour.resetsAt,
+        utilization: w.util.fiveHour.utilization
       },
       sevenDay: {
-        windowStart: iso(windows.sevenDay.start),
-        windowEnd: iso(windows.sevenDay.end),
-        resetsAt: null,
-        utilization: null,
-        opusUtilization: null
+        windowStart: iso(w.sevenDay.start),
+        windowEnd: iso(w.sevenDay.end),
+        resetsAt: w.sevenDay.resetsAt,
+        utilization: w.util.sevenDay.utilization,
+        opusUtilization: w.util.sevenDay.opusUtilization
       },
       usageUpdatedAt: summary.usageUpdatedAt
     },
-    keys: {
-      fiveHour: fiveHour.items,
-      sevenDay: sevenDay.items
-    },
+    keys: { fiveHour: fiveHour.items, sevenDay: sevenDay.items },
     totals: {
       fiveHour: { cost: fiveHour.totalCost, tokens: fiveHour.totalTokens },
       sevenDay: { cost: sevenDay.totalCost, tokens: sevenDay.totalTokens }
@@ -203,9 +248,7 @@ async function accountReport(name, now) {
   )
   if (rows.length === 0) return { found: false, reports: [] }
   const reports = []
-  for (const acc of rows) {
-    reports.push(await buildAccountReport(acc, now))
-  }
+  for (const acc of rows) reports.push(await buildAccountReport(acc, now))
   return { found: true, reports }
 }
 
@@ -213,15 +256,86 @@ function looksLikeToken(s) {
   return typeof s === 'string' && s.startsWith(API_KEY_PREFIX)
 }
 
-// Per-key window: rolling (keys have no Anthropic session window), broken down
-// by account because a crs2 key can be served by multiple upstream accounts.
-async function collectKeyWindow(keyId, start, end) {
-  const totalP = query(
+async function loadAccountById(accountId) {
+  const { rows } = await query(`SELECT ${ACCOUNT_COLS} FROM accounts WHERE id = $1`, [accountId])
+  return rows[0] || null
+}
+
+// The key's cost + its account-total cost within one window, for a share calc.
+async function keyShareInWindow(accountId, keyId, window) {
+  const mineP = query(
     `SELECT ${USAGE_SELECT} FROM usage_logs u
-     WHERE u.api_key_id = $1 AND u.created_at >= $2 AND u.created_at <= $3`,
-    [keyId, start, end]
+     WHERE u.account_id = $1 AND u.api_key_id = $2 AND u.created_at >= $3 AND u.created_at <= $4`,
+    [accountId, keyId, window.start, window.end]
   )
-  const byAcctP = query(
+  const totalP = query(
+    `SELECT COALESCE(sum(total_cost), 0) AS cost FROM usage_logs
+     WHERE account_id = $1 AND created_at >= $2 AND created_at <= $3`,
+    [accountId, window.start, window.end]
+  )
+  const [mineRes, totalRes] = await Promise.all([mineP, totalP])
+  const mine = rowToUsage(mineRes.rows[0])
+  const accountTotal = parseFloat(totalRes.rows[0].cost) || 0
+  return { mine, accountTotal }
+}
+
+function windowReport(window, mine, accountTotal, utilization) {
+  const share = accountTotal > 0 ? mine.cost / accountTotal : 0
+  return {
+    windowStart: iso(window.start),
+    windowEnd: iso(window.end),
+    resetsAt: window.resetsAt,
+    cost: round(mine.cost, 4),
+    tokens: mine.tokens,
+    requests: mine.requests,
+    activeHours: mine.activeHours,
+    accountTotalCost: round(accountTotal, 4),
+    shareOfAccount: round(share, 8),
+    accountUtilization: utilization,
+    contributionToUtilization: utilization != null ? round(utilization * share, 4) : null
+  }
+}
+
+function emptyWindowReport() {
+  return {
+    windowStart: null,
+    windowEnd: null,
+    resetsAt: null,
+    cost: 0,
+    tokens: emptyTokens(),
+    requests: 0,
+    activeHours: 0,
+    accountTotalCost: 0,
+    shareOfAccount: null,
+    accountUtilization: null,
+    contributionToUtilization: null
+  }
+}
+
+function accountDetail(accountRow) {
+  if (!accountRow) return null
+  const s = summarizeAccountRow(accountRow)
+  return {
+    id: s.id,
+    name: s.name,
+    platform: s.platform,
+    accountType: s.accountType,
+    status: s.status,
+    schedulable: s.schedulable,
+    sessionWindowStatus: s.sessionWindowStatus,
+    sessionWindowStart: s.sessionWindowStart,
+    sessionWindowEnd: s.sessionWindowEnd,
+    errorMessage: s.errorMessage,
+    fiveHour: s.fiveHour,
+    sevenDay: s.sevenDay,
+    lastUsedAt: s.lastUsedAt,
+    usageUpdatedAt: s.usageUpdatedAt
+  }
+}
+
+// The key's cost split across the accounts that served it in the trailing 7d.
+async function keyByAccount(keyId, start, end) {
+  const { rows } = await query(
     `SELECT u.account_id, ${USAGE_SELECT}, a.name AS account_name
      FROM usage_logs u
      LEFT JOIN accounts a ON a.id = u.account_id
@@ -230,9 +344,7 @@ async function collectKeyWindow(keyId, start, end) {
      ORDER BY cost DESC`,
     [keyId, start, end]
   )
-  const [totalRes, byAcctRes] = await Promise.all([totalP, byAcctP])
-  const usage = rowToUsage(totalRes.rows[0])
-  const byAccount = byAcctRes.rows.map((r) => {
+  return rows.map((r) => {
     const u = rowToUsage(r)
     return {
       accountId: r.account_id != null ? String(r.account_id) : null,
@@ -243,15 +355,42 @@ async function collectKeyWindow(keyId, start, end) {
       activeHours: u.activeHours
     }
   })
+}
+
+async function buildKeyReport(keyRow, now) {
+  const since7d = new Date(now.getTime() - SEVEN_DAYS_MS)
+  const byAccount = await keyByAccount(keyRow.id, since7d, now)
+  // Primary account = where this key spent the most in the trailing 7d.
+  const primary = byAccount.find((b) => b.accountId != null) || null
+  const accountRow = primary ? await loadAccountById(primary.accountId) : null
+
+  let fiveHour = emptyWindowReport()
+  let sevenDay = emptyWindowReport()
+  if (accountRow) {
+    const w = accountWindows(accountRow, now)
+    const [fiveShare, sevenShare] = await Promise.all([
+      keyShareInWindow(accountRow.id, keyRow.id, w.fiveHour),
+      keyShareInWindow(accountRow.id, keyRow.id, w.sevenDay)
+    ])
+    fiveHour = windowReport(w.fiveHour, fiveShare.mine, fiveShare.accountTotal, w.util.fiveHour.utilization)
+    sevenDay = windowReport(w.sevenDay, sevenShare.mine, sevenShare.accountTotal, w.util.sevenDay.utilization)
+  }
+  fiveHour.byAccount = byAccount
+  sevenDay.byAccount = byAccount
+
+  const detail = accountDetail(accountRow)
   return {
-    windowStart: iso(start),
-    windowEnd: iso(end),
-    resetsAt: null,
-    cost: round(usage.cost, 4),
-    tokens: usage.tokens,
-    requests: usage.requests,
-    activeHours: usage.activeHours,
-    byAccount
+    key: {
+      id: String(keyRow.id),
+      name: keyRow.name,
+      isActive: keyRow.status === 'active',
+      userId: keyRow.user_id != null ? String(keyRow.user_id) : null,
+      accountId: detail ? detail.id : null,
+      accountName: detail ? detail.name : null
+    },
+    account: detail,
+    fiveHour,
+    sevenDay
   }
 }
 
@@ -264,31 +403,8 @@ async function keyReport(identifier, now) {
     [identifier]
   )
   if (rows.length === 0) return { matches: [], mode }
-
-  const start5h = new Date(now.getTime() - FIVE_HOURS_MS)
-  const start7d = new Date(now.getTime() - SEVEN_DAYS_MS)
-
   const reports = []
-  for (const k of rows) {
-    const [fiveHour, sevenDay] = await Promise.all([
-      collectKeyWindow(k.id, start5h, now),
-      collectKeyWindow(k.id, start7d, now)
-    ])
-    reports.push({
-      key: {
-        id: String(k.id),
-        name: k.name,
-        isActive: k.status === 'active',
-        userId: k.user_id != null ? String(k.user_id) : null,
-        // crs2 keys are not statically bound to a single account.
-        accountId: null,
-        accountName: null
-      },
-      account: null,
-      fiveHour,
-      sevenDay
-    })
-  }
+  for (const k of rows) reports.push(await buildKeyReport(k, now))
   return { matches: reports, mode }
 }
 

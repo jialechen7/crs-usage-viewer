@@ -311,10 +311,11 @@ const CRS2_SPEC = {
     version: '0.2.0',
     description:
       '只读 HTTP 服务,从 crs2 (sub2api) 的 **PostgreSQL** 读取用量,按 5h / 7d 窗口聚合后返回。\n\n' +
-      '与 crs 的差异(数据模型不同):\n' +
-      '- 账号没有 Anthropic utilization 百分比,所有 `utilization*` 字段恒为 `null`。\n' +
-      '- 账号 5h 窗口取自 `session_window_start/end`;无会话窗时回退为滚动 5h。7d 为滚动窗。\n' +
-      '- key 与账号**非静态绑定**:`/key` 返回 `account: null`,改用 `byAccount` 给出按账号拆分的明细。\n' +
+      '响应结构与 crs 后端**保持一致**(同一客户端可同时消费两者):\n' +
+      '- 上游 utilization 来自 `accounts.extra`(Anthropic: `session_window_utilization` / `passive_usage_7d_utilization`;OpenAI/Codex: `codex_*_used_percent`),已归一到 0–100。\n' +
+      '- 账号 5h/7d 窗口对齐各自的 reset(5h=`session_window_end` 或 `codex_5h_reset_at`;7d=`passive_usage_7d_reset` 或 `codex_7d_reset_at`)。\n' +
+      '- 无 Opus 单独用量 → `opusUtilization` 恒为 `null`。\n' +
+      '- key 非静态绑定账号:`/key` 取**主账号**(近 7d 花费最多者)算 `shareOfAccount` / `contributionToUtilization`,并额外给出 `byAccount` 明细。\n' +
       '- token 直查匹配明文 `sk-` key,无需 ENCRYPTION_KEY。'
   },
   servers: [
@@ -414,8 +415,8 @@ const CRS2_SPEC = {
           fiveHour: {
             type: 'object',
             properties: {
-              resetsAt: { type: 'string', format: 'date-time', nullable: true, description: '= session_window_end' },
-              utilization: { type: 'number', nullable: true, description: 'crs2 恒为 null' }
+              resetsAt: { type: 'string', format: 'date-time', nullable: true, description: '5h reset(session_window_end / codex_5h_reset_at)' },
+              utilization: { type: 'number', nullable: true, description: '0–100,来自 accounts.extra' }
             }
           },
           sevenDay: {
@@ -456,7 +457,7 @@ const CRS2_SPEC = {
           requests: { type: 'integer' },
           activeHours: { type: 'integer' },
           shareOfWindow: { type: 'number', description: '0–1。8 位小数。' },
-          contributionToUtilization: { type: 'number', nullable: true, description: 'crs2 恒为 null' }
+          contributionToUtilization: { type: 'number', nullable: true, description: '= utilization × shareOfWindow' }
         }
       },
       AccountReport: {
@@ -525,12 +526,16 @@ const CRS2_SPEC = {
         properties: {
           windowStart: { type: 'string', format: 'date-time' },
           windowEnd: { type: 'string', format: 'date-time' },
-          resetsAt: { type: 'string', format: 'date-time', nullable: true, description: 'crs2 滚动窗,恒为 null' },
-          cost: { type: 'number', description: 'USD' },
+          resetsAt: { type: 'string', format: 'date-time', nullable: true },
+          cost: { type: 'number', description: 'USD,该 key 在主账号该窗口的花费' },
           tokens: { $ref: '#/components/schemas/Tokens' },
           requests: { type: 'integer' },
           activeHours: { type: 'integer' },
-          byAccount: { type: 'array', items: { $ref: '#/components/schemas/KeyAccountBreakdown' } }
+          accountTotalCost: { type: 'number', description: '主账号该窗口总花费 USD' },
+          shareOfAccount: { type: 'number', nullable: true, description: '0–1,8 位小数' },
+          accountUtilization: { type: 'number', nullable: true, description: '0–100' },
+          contributionToUtilization: { type: 'number', nullable: true, description: '= accountUtilization × shareOfAccount' },
+          byAccount: { type: 'array', items: { $ref: '#/components/schemas/KeyAccountBreakdown' }, description: '近 7d 该 key 在各账号的花费明细' }
         }
       },
       KeyReport: {
@@ -543,14 +548,20 @@ const CRS2_SPEC = {
               name: { type: 'string' },
               isActive: { type: 'boolean' },
               userId: { type: 'string', nullable: true },
-              accountId: { type: 'string', nullable: true, description: 'crs2 恒为 null' },
-              accountName: { type: 'string', nullable: true, description: 'crs2 恒为 null' }
+              accountId: { type: 'string', nullable: true, description: '主账号(近 7d 花费最多者)' },
+              accountName: { type: 'string', nullable: true }
             }
           },
-          account: { type: 'object', nullable: true, description: 'crs2 恒为 null(key 非静态绑定账号)' },
+          account: { $ref: '#/components/schemas/FullAccountDetail' },
           fiveHour: { $ref: '#/components/schemas/KeyWindowReport' },
           sevenDay: { $ref: '#/components/schemas/KeyWindowReport' }
         }
+      },
+      FullAccountDetail: {
+        allOf: [
+          { $ref: '#/components/schemas/AccountSummary' },
+          { type: 'object', description: '主账号详情(含 utilization / session window),无用量时为 null' }
+        ]
       },
       Error: { type: 'object', properties: { error: { type: 'string' }, name: { type: 'string' } } },
       KeyNotFoundError: {

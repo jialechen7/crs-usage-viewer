@@ -6,6 +6,7 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
 // 否则读到的 key 全是 0(我们查的小时和它写入时拼的小时不一致)。
 const TIMEZONE_OFFSET_HOURS = Number(process.env.TIMEZONE_OFFSET || 8)
 const TIMEZONE_OFFSET_MS = TIMEZONE_OFFSET_HOURS * 3600000
+const { applyQuotaResetCursor } = require('./quotaResetTracker')
 
 function parseIso(s) {
   if (!s) return null
@@ -25,6 +26,32 @@ function resolveSevenDayWindow(accountHash, now = new Date()) {
   if (!resetsAt) return null
   const start = new Date(resetsAt.getTime() - SEVEN_DAYS_MS)
   return { start, end: now, resetsAt }
+}
+
+function resolveEffectiveFiveHourWindow(accountHash, now = new Date()) {
+  const window = resolveFiveHourWindow(accountHash, now)
+  return applyQuotaResetCursor({
+    backend: 'crs',
+    accountId: accountHash && accountHash.id,
+    windowType: 'fiveHour',
+    window,
+    utilization: accountHash && accountHash.claudeFiveHourUtilization,
+    observedAt: accountHash && accountHash.claudeUsageUpdatedAt,
+    now
+  })
+}
+
+function resolveEffectiveSevenDayWindow(accountHash, now = new Date()) {
+  const window = resolveSevenDayWindow(accountHash, now)
+  return applyQuotaResetCursor({
+    backend: 'crs',
+    accountId: accountHash && accountHash.id,
+    windowType: 'sevenDay',
+    window,
+    utilization: accountHash && accountHash.claudeSevenDayUtilization,
+    observedAt: accountHash && accountHash.claudeUsageUpdatedAt,
+    now
+  })
 }
 
 // 返回 CRS 时区下 (yyyy-mm-dd, HH) 用于拼 Redis key。
@@ -53,6 +80,8 @@ function iterHourKeys(start, end) {
 module.exports = {
   resolveFiveHourWindow,
   resolveSevenDayWindow,
+  resolveEffectiveFiveHourWindow,
+  resolveEffectiveSevenDayWindow,
   iterHourKeys,
   dateHourInTz,
   TIMEZONE_OFFSET_HOURS

@@ -34,6 +34,7 @@ token 以 `cr_` 开头时按 token 查(需配置 `ENCRYPTION_KEY` 与 CRS 一致
 窗口边界对齐 Anthropic 计费:
 - 5h 窗口 = `claudeFiveHourResetsAt - 5h` ~ now
 - 7d 窗口 = `claudeSevenDayResetsAt - 7d` ~ now
+- 如果 Anthropic 已经重置额度但 reset 时间未推进,服务会把实际统计起点推进到 reset 后或本地检测到的 reset cursor,避免用重置前的用量稀释当前 utilization 占比。
 
 ### crs2 后端(Postgres / sub2api)
 

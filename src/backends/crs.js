@@ -9,9 +9,17 @@ const {
   aggregateKeyUsage,
   round
 } = require('../lib/usageAggregator')
-const { resolveFiveHourWindow, resolveSevenDayWindow } = require('../lib/windowResolver')
+const {
+  resolveEffectiveFiveHourWindow,
+  resolveEffectiveSevenDayWindow
+} = require('../lib/windowResolver')
+const { utilizationForWindow } = require('../lib/quotaResetTracker')
 const { looksLikeToken, resolveKeyIdByToken, loadKeyById } = require('../lib/apiKeyResolver')
 const { summarizeAccount } = require('../lib/accountSerializer')
+
+const QUOTA_RESET_SAMPLER_INTERVAL_MS = Number(
+  process.env.QUOTA_RESET_SAMPLER_INTERVAL_MS || 60000
+)
 
 async function health() {
   try {
@@ -61,13 +69,14 @@ function summarizeWindow(window) {
   return {
     windowStart: window.start.toISOString(),
     windowEnd: window.end.toISOString(),
-    resetsAt: window.resetsAt.toISOString()
+    resetsAt: window.resetsAt.toISOString(),
+    quotaResetAt: window.quotaResetAt || null
   }
 }
 
 async function buildAccountReport(account, now) {
-  const fiveHourWindow = resolveFiveHourWindow(account, now)
-  const sevenDayWindow = resolveSevenDayWindow(account, now)
+  const fiveHourWindow = resolveEffectiveFiveHourWindow(account, now)
+  const sevenDayWindow = resolveEffectiveSevenDayWindow(account, now)
 
   const keys = await findKeysBoundToAccount(account.id)
 
@@ -103,14 +112,16 @@ async function buildAccountReport(account, now) {
   const fiveHour = await collect(fiveHourWindow)
   const sevenDay = await collect(sevenDayWindow)
 
-  const fiveHourUtilization =
-    account.claudeFiveHourUtilization !== undefined && account.claudeFiveHourUtilization !== ''
-      ? Number(account.claudeFiveHourUtilization)
-      : null
-  const sevenDayUtilization =
-    account.claudeSevenDayUtilization !== undefined && account.claudeSevenDayUtilization !== ''
-      ? Number(account.claudeSevenDayUtilization)
-      : null
+  const fiveHourUtilization = utilizationForWindow(
+    account.claudeFiveHourUtilization,
+    fiveHourWindow,
+    account.claudeUsageUpdatedAt
+  )
+  const sevenDayUtilization = utilizationForWindow(
+    account.claudeSevenDayUtilization,
+    sevenDayWindow,
+    account.claudeUsageUpdatedAt
+  )
 
   for (const item of fiveHour.items) {
     item.contributionToUtilization =
@@ -213,13 +224,18 @@ async function buildWindowReport(keyRow, account, window, windowType) {
     }
   }
 
-  const utilization = pickUtilization(account, windowType)
+  const utilization = utilizationForWindow(
+    pickUtilization(account, windowType),
+    window,
+    account.claudeUsageUpdatedAt
+  )
   const share = accountTotal > 0 ? myUsage.cost / accountTotal : 0
 
   return {
     windowStart: window.start.toISOString(),
     windowEnd: window.end.toISOString(),
     resetsAt: window.resetsAt.toISOString(),
+    quotaResetAt: window.quotaResetAt || null,
     cost: round(myUsage.cost, 4),
     tokens: myUsage.tokens,
     requests: myUsage.requests,
@@ -254,8 +270,8 @@ async function keyReport(identifier, now) {
   for (const k of matches) {
     const accountId = k.claudeAccountId || k.claudeConsoleAccountId || null
     const account = await loadAccountHash(accountId)
-    const fiveHourWindow = account ? resolveFiveHourWindow(account, now) : null
-    const sevenDayWindow = account ? resolveSevenDayWindow(account, now) : null
+    const fiveHourWindow = account ? resolveEffectiveFiveHourWindow(account, now) : null
+    const sevenDayWindow = account ? resolveEffectiveSevenDayWindow(account, now) : null
 
     reports.push({
       key: {
@@ -273,10 +289,34 @@ async function keyReport(identifier, now) {
   return { matches: reports, mode }
 }
 
+async function sampleQuotaWindows() {
+  const accounts = await listAllAccounts()
+  const now = new Date()
+  for (const account of accounts) {
+    resolveEffectiveSevenDayWindow(account, now)
+  }
+}
+
+function startQuotaSampler() {
+  if (!QUOTA_RESET_SAMPLER_INTERVAL_MS) return
+
+  const run = async () => {
+    try {
+      await sampleQuotaWindows()
+    } catch (err) {
+      console.error('[crs] quota sampler failed', err.message)
+    }
+  }
+
+  setTimeout(run, 1000)
+  setInterval(run, QUOTA_RESET_SAMPLER_INTERVAL_MS)
+}
+
 module.exports = {
   name: 'crs',
   health,
   listAccounts,
   accountReport,
-  keyReport
+  keyReport,
+  startQuotaSampler
 }

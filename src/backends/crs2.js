@@ -10,10 +10,17 @@
 //     full breakdown).
 const { query } = require('../pg')
 const { round } = require('../lib/usageAggregator')
+const {
+  applyQuotaResetCursor,
+  utilizationForWindow
+} = require('../lib/quotaResetTracker')
 
 const API_KEY_PREFIX = process.env.CRS2_API_KEY_PREFIX || 'sk-'
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
+const QUOTA_RESET_SAMPLER_INTERVAL_MS = Number(
+  process.env.QUOTA_RESET_SAMPLER_INTERVAL_MS || 60000
+)
 
 function iso(d) {
   if (d == null) return null
@@ -100,7 +107,7 @@ function utilFromAccount(a) {
 
 // Aggregation windows aligned to the utilization resets so a key's cost share
 // lines up with the utilization the share is multiplied against.
-function accountWindows(a, now) {
+async function accountWindows(a, now) {
   const u = utilFromAccount(a)
   const reset5h = u.fiveHour.resetsAt ? new Date(u.fiveHour.resetsAt) : null
   const reset7d = u.sevenDay.resetsAt ? new Date(u.sevenDay.resetsAt) : null
@@ -112,10 +119,29 @@ function accountWindows(a, now) {
   const start7d = reset7d
     ? new Date(reset7d.getTime() - SEVEN_DAYS_MS)
     : new Date(now.getTime() - SEVEN_DAYS_MS)
+  const fiveHour = applyQuotaResetCursor({
+    backend: 'crs2',
+    accountId: a.id,
+    windowType: 'fiveHour',
+    window: { start: start5h, end: now, resetsAt: u.fiveHour.resetsAt },
+    utilization: u.fiveHour.utilization,
+    observedAt: u.sampledAt,
+    now
+  })
+  const nominalSevenDayWindow = { start: start7d, end: now, resetsAt: u.sevenDay.resetsAt }
+  const sevenDay = applyQuotaResetCursor({
+    backend: 'crs2',
+    accountId: a.id,
+    windowType: 'sevenDay',
+    window: nominalSevenDayWindow,
+    utilization: u.sevenDay.utilization,
+    observedAt: u.sampledAt,
+    now
+  })
   return {
     util: u,
-    fiveHour: { start: start5h, end: now, resetsAt: u.fiveHour.resetsAt },
-    sevenDay: { start: start7d, end: now, resetsAt: u.sevenDay.resetsAt }
+    fiveHour,
+    sevenDay
   }
 }
 
@@ -158,6 +184,31 @@ async function listAccounts() {
     `SELECT ${ACCOUNT_COLS} FROM accounts WHERE deleted_at IS NULL ORDER BY id`
   )
   return rows.map(summarizeAccountRow)
+}
+
+async function sampleQuotaWindows() {
+  const { rows } = await query(
+    `SELECT ${ACCOUNT_COLS} FROM accounts WHERE deleted_at IS NULL ORDER BY id`
+  )
+  const now = new Date()
+  for (const account of rows) {
+    await accountWindows(account, now)
+  }
+}
+
+function startQuotaSampler() {
+  if (!QUOTA_RESET_SAMPLER_INTERVAL_MS) return
+
+  const run = async () => {
+    try {
+      await sampleQuotaWindows()
+    } catch (err) {
+      console.error('[crs2] quota sampler failed', err.message)
+    }
+  }
+
+  setTimeout(run, 1000)
+  setInterval(run, QUOTA_RESET_SAMPLER_INTERVAL_MS)
 }
 
 async function collectAccountWindow(accountId, window, utilization) {
@@ -205,9 +256,19 @@ async function collectAccountWindow(accountId, window, utilization) {
 }
 
 async function buildAccountReport(accountRow, now) {
-  const w = accountWindows(accountRow, now)
-  const fiveHour = await collectAccountWindow(accountRow.id, w.fiveHour, w.util.fiveHour.utilization)
-  const sevenDay = await collectAccountWindow(accountRow.id, w.sevenDay, w.util.sevenDay.utilization)
+  const w = await accountWindows(accountRow, now)
+  const fiveHourUtilization = utilizationForWindow(
+    w.util.fiveHour.utilization,
+    w.fiveHour,
+    w.util.sampledAt
+  )
+  const sevenDayUtilization = utilizationForWindow(
+    w.util.sevenDay.utilization,
+    w.sevenDay,
+    w.util.sampledAt
+  )
+  const fiveHour = await collectAccountWindow(accountRow.id, w.fiveHour, fiveHourUtilization)
+  const sevenDay = await collectAccountWindow(accountRow.id, w.sevenDay, sevenDayUtilization)
   const summary = summarizeAccountRow(accountRow)
 
   return {
@@ -222,13 +283,16 @@ async function buildAccountReport(accountRow, now) {
         windowStart: iso(w.fiveHour.start),
         windowEnd: iso(w.fiveHour.end),
         resetsAt: w.fiveHour.resetsAt,
-        utilization: w.util.fiveHour.utilization
+        quotaResetAt: w.fiveHour.quotaResetAt || null,
+        utilization: fiveHourUtilization
       },
       sevenDay: {
         windowStart: iso(w.sevenDay.start),
         windowEnd: iso(w.sevenDay.end),
         resetsAt: w.sevenDay.resetsAt,
-        utilization: w.util.sevenDay.utilization,
+        quotaResetAt: w.sevenDay.quotaResetAt || null,
+        quotaResetDetectedBy: w.sevenDay.quotaResetDetectedBy || null,
+        utilization: sevenDayUtilization,
         opusUtilization: w.util.sevenDay.opusUtilization
       },
       usageUpdatedAt: summary.usageUpdatedAt
@@ -285,6 +349,8 @@ function windowReport(window, mine, accountTotal, utilization) {
     windowStart: iso(window.start),
     windowEnd: iso(window.end),
     resetsAt: window.resetsAt,
+    quotaResetAt: window.quotaResetAt || null,
+    quotaResetDetectedBy: window.quotaResetDetectedBy || null,
     cost: round(mine.cost, 4),
     tokens: mine.tokens,
     requests: mine.requests,
@@ -359,24 +425,40 @@ async function keyByAccount(keyId, start, end) {
 
 async function buildKeyReport(keyRow, now) {
   const since7d = new Date(now.getTime() - SEVEN_DAYS_MS)
-  const byAccount = await keyByAccount(keyRow.id, since7d, now)
+  const trailingByAccount = await keyByAccount(keyRow.id, since7d, now)
   // Primary account = where this key spent the most in the trailing 7d.
-  const primary = byAccount.find((b) => b.accountId != null) || null
+  const primary = trailingByAccount.find((b) => b.accountId != null) || null
   const accountRow = primary ? await loadAccountById(primary.accountId) : null
 
   let fiveHour = emptyWindowReport()
   let sevenDay = emptyWindowReport()
+  let fiveHourByAccount = []
+  let sevenDayByAccount = []
   if (accountRow) {
-    const w = accountWindows(accountRow, now)
-    const [fiveShare, sevenShare] = await Promise.all([
+    const w = await accountWindows(accountRow, now)
+    const fiveHourUtilization = utilizationForWindow(
+      w.util.fiveHour.utilization,
+      w.fiveHour,
+      w.util.sampledAt
+    )
+    const sevenDayUtilization = utilizationForWindow(
+      w.util.sevenDay.utilization,
+      w.sevenDay,
+      w.util.sampledAt
+    )
+    const [fiveShare, sevenShare, fiveBreakdown, sevenBreakdown] = await Promise.all([
       keyShareInWindow(accountRow.id, keyRow.id, w.fiveHour),
-      keyShareInWindow(accountRow.id, keyRow.id, w.sevenDay)
+      keyShareInWindow(accountRow.id, keyRow.id, w.sevenDay),
+      keyByAccount(keyRow.id, w.fiveHour.start, w.fiveHour.end),
+      keyByAccount(keyRow.id, w.sevenDay.start, w.sevenDay.end)
     ])
-    fiveHour = windowReport(w.fiveHour, fiveShare.mine, fiveShare.accountTotal, w.util.fiveHour.utilization)
-    sevenDay = windowReport(w.sevenDay, sevenShare.mine, sevenShare.accountTotal, w.util.sevenDay.utilization)
+    fiveHour = windowReport(w.fiveHour, fiveShare.mine, fiveShare.accountTotal, fiveHourUtilization)
+    sevenDay = windowReport(w.sevenDay, sevenShare.mine, sevenShare.accountTotal, sevenDayUtilization)
+    fiveHourByAccount = fiveBreakdown
+    sevenDayByAccount = sevenBreakdown
   }
-  fiveHour.byAccount = byAccount
-  sevenDay.byAccount = byAccount
+  fiveHour.byAccount = fiveHourByAccount
+  sevenDay.byAccount = sevenDayByAccount
 
   const detail = accountDetail(accountRow)
   return {
@@ -413,5 +495,6 @@ module.exports = {
   health,
   listAccounts,
   accountReport,
-  keyReport
+  keyReport,
+  startQuotaSampler
 }

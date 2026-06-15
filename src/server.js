@@ -21,6 +21,9 @@ function mountBackend(basePath, backend) {
   app.use(basePath, makeAccountRouter(backend))
   app.use(basePath, makeKeyRouter(backend))
   app.use(basePath, makeDocsRouter(backend, basePath))
+  if (typeof backend.startQuotaSampler === 'function') {
+    backend.startQuotaSampler()
+  }
 }
 
 // crs2 first so /stats/crs2/* is resolved before the crs /stats/* routes.

@@ -11,6 +11,7 @@
 const { query } = require('../pg')
 const { round } = require('../lib/usageAggregator')
 const {
+  applyManualResetOverride,
   applyQuotaResetCursor,
   utilizationForWindow
 } = require('../lib/quotaResetTracker')
@@ -107,7 +108,7 @@ function utilFromAccount(a) {
 
 // Aggregation windows aligned to the utilization resets so a key's cost share
 // lines up with the utilization the share is multiplied against.
-async function accountWindows(a, now) {
+async function accountWindows(a, now, options = {}) {
   const u = utilFromAccount(a)
   const reset5h = u.fiveHour.resetsAt ? new Date(u.fiveHour.resetsAt) : null
   const reset7d = u.sevenDay.resetsAt ? new Date(u.sevenDay.resetsAt) : null
@@ -119,16 +120,34 @@ async function accountWindows(a, now) {
   const start7d = reset7d
     ? new Date(reset7d.getTime() - SEVEN_DAYS_MS)
     : new Date(now.getTime() - SEVEN_DAYS_MS)
+  const nominalFiveHourWindow = { start: start5h, end: now, resetsAt: u.fiveHour.resetsAt }
+  const nominalSevenDayWindow = { start: start7d, end: now, resetsAt: u.sevenDay.resetsAt }
+  if (options.effectiveWindows === false) {
+    return {
+      util: u,
+      fiveHour: applyManualResetOverride({
+        backend: 'crs2',
+        accountId: a.id,
+        windowType: 'fiveHour',
+        window: nominalFiveHourWindow
+      }),
+      sevenDay: applyManualResetOverride({
+        backend: 'crs2',
+        accountId: a.id,
+        windowType: 'sevenDay',
+        window: nominalSevenDayWindow
+      })
+    }
+  }
   const fiveHour = applyQuotaResetCursor({
     backend: 'crs2',
     accountId: a.id,
     windowType: 'fiveHour',
-    window: { start: start5h, end: now, resetsAt: u.fiveHour.resetsAt },
+    window: nominalFiveHourWindow,
     utilization: u.fiveHour.utilization,
     observedAt: u.sampledAt,
     now
   })
-  const nominalSevenDayWindow = { start: start7d, end: now, resetsAt: u.sevenDay.resetsAt }
   const sevenDay = applyQuotaResetCursor({
     backend: 'crs2',
     accountId: a.id,
@@ -255,8 +274,8 @@ async function collectAccountWindow(accountId, window, utilization) {
   return { items, totalCost: round(totalCost, 4), totalTokens }
 }
 
-async function buildAccountReport(accountRow, now) {
-  const w = await accountWindows(accountRow, now)
+async function buildAccountReport(accountRow, now, options = {}) {
+  const w = await accountWindows(accountRow, now, options)
   const fiveHourUtilization = utilizationForWindow(
     w.util.fiveHour.utilization,
     w.fiveHour,
@@ -305,14 +324,14 @@ async function buildAccountReport(accountRow, now) {
   }
 }
 
-async function accountReport(name, now) {
+async function accountReport(name, now, options = {}) {
   const { rows } = await query(
     `SELECT ${ACCOUNT_COLS} FROM accounts WHERE name = $1 AND deleted_at IS NULL ORDER BY id`,
     [name]
   )
   if (rows.length === 0) return { found: false, reports: [] }
   const reports = []
-  for (const acc of rows) reports.push(await buildAccountReport(acc, now))
+  for (const acc of rows) reports.push(await buildAccountReport(acc, now, options))
   return { found: true, reports }
 }
 

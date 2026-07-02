@@ -3,6 +3,7 @@ node_modules/
 logs/
 *.log
 .quota-reset-state.json
+.quota-reset-overrides.json
 .DS_Store
 .idea/
 .vscode/

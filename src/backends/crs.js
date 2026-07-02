@@ -10,10 +10,12 @@ const {
   round
 } = require('../lib/usageAggregator')
 const {
+  resolveFiveHourWindow,
+  resolveSevenDayWindow,
   resolveEffectiveFiveHourWindow,
   resolveEffectiveSevenDayWindow
 } = require('../lib/windowResolver')
-const { utilizationForWindow } = require('../lib/quotaResetTracker')
+const { applyManualResetOverride, utilizationForWindow } = require('../lib/quotaResetTracker')
 const { looksLikeToken, resolveKeyIdByToken, loadKeyById } = require('../lib/apiKeyResolver')
 const { summarizeAccount } = require('../lib/accountSerializer')
 
@@ -74,9 +76,24 @@ function summarizeWindow(window) {
   }
 }
 
-async function buildAccountReport(account, now) {
-  const fiveHourWindow = resolveEffectiveFiveHourWindow(account, now)
-  const sevenDayWindow = resolveEffectiveSevenDayWindow(account, now)
+async function buildAccountReport(account, now, options = {}) {
+  const useEffectiveWindows = options.effectiveWindows !== false
+  const fiveHourWindow = useEffectiveWindows
+    ? resolveEffectiveFiveHourWindow(account, now)
+    : applyManualResetOverride({
+        backend: 'crs',
+        accountId: account.id,
+        windowType: 'fiveHour',
+        window: resolveFiveHourWindow(account, now)
+      })
+  const sevenDayWindow = useEffectiveWindows
+    ? resolveEffectiveSevenDayWindow(account, now)
+    : applyManualResetOverride({
+        backend: 'crs',
+        accountId: account.id,
+        windowType: 'sevenDay',
+        window: resolveSevenDayWindow(account, now)
+      })
 
   const keys = await findKeysBoundToAccount(account.id)
 
@@ -165,12 +182,12 @@ async function buildAccountReport(account, now) {
   }
 }
 
-async function accountReport(name, now) {
+async function accountReport(name, now, options = {}) {
   const matches = await findAccountsByName(name)
   if (matches.length === 0) return { found: false, reports: [] }
   const reports = []
   for (const acc of matches) {
-    reports.push(await buildAccountReport(acc, now))
+    reports.push(await buildAccountReport(acc, now, options))
   }
   return { found: true, reports }
 }

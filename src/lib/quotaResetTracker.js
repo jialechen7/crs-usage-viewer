@@ -3,7 +3,10 @@ const path = require('path')
 
 const DEFAULT_STATE_PATH = path.join(process.cwd(), '.quota-reset-state.json')
 const STATE_PATH = process.env.QUOTA_RESET_STATE_PATH || DEFAULT_STATE_PATH
+const DEFAULT_OVERRIDES_PATH = path.join(process.cwd(), '.quota-reset-overrides.json')
+const OVERRIDES_PATH = process.env.QUOTA_RESET_OVERRIDES_PATH || DEFAULT_OVERRIDES_PATH
 const DROP_EPSILON = 0.0001
+const ENABLE_UTILIZATION_DROP_RESETS = process.env.ENABLE_UTILIZATION_DROP_RESETS === 'true'
 const RESET_UTILIZATION_DROP_MIN = Number(process.env.RESET_UTILIZATION_DROP_MIN || 1)
 const RESET_TIME_CHANGE_TOLERANCE_MS = Number(
   process.env.RESET_TIME_CHANGE_TOLERANCE_MS || 5 * 60 * 1000
@@ -11,6 +14,8 @@ const RESET_TIME_CHANGE_TOLERANCE_MS = Number(
 
 let loaded = false
 let state = {}
+let overridesLoaded = false
+let overrides = {}
 
 function parseDate(value) {
   if (!value) return null
@@ -43,6 +48,35 @@ function writeState() {
     fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2))
   } catch (err) {
     console.error('[quota-reset-tracker] write failed', err.message)
+  }
+}
+
+function readOverrides() {
+  if (overridesLoaded) return overrides
+  overridesLoaded = true
+  try {
+    const raw = fs.readFileSync(OVERRIDES_PATH, 'utf8')
+    if (!raw.trim()) {
+      overrides = {}
+      return overrides
+    }
+    const parsed = JSON.parse(raw)
+    overrides = parsed && typeof parsed === 'object' ? parsed : {}
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      console.error('[quota-reset-tracker] override read failed', err.message)
+    }
+    overrides = {}
+  }
+  return overrides
+}
+
+function writeOverrides() {
+  try {
+    fs.writeFileSync(OVERRIDES_PATH, JSON.stringify(overrides, null, 2))
+  } catch (err) {
+    console.error('[quota-reset-tracker] override write failed', err.message)
+    throw err
   }
 }
 
@@ -88,6 +122,62 @@ function getQuotaResetCursor({ backend, accountId, windowType }) {
   const store = readState()
   const value = store[stateKey({ backend, accountId, windowType })]
   return value ? { ...value } : null
+}
+
+function listManualResetOverrides() {
+  return { ...readOverrides() }
+}
+
+function setManualResetOverride({ backend, accountId, windowType, resetAt, note }) {
+  const reset = parseDate(resetAt)
+  if (!reset) {
+    const err = new Error('invalid resetAt')
+    err.status = 400
+    throw err
+  }
+  const key = stateKey({ backend, accountId, windowType })
+  const store = readOverrides()
+  store[key] = note ? { resetAt: reset.toISOString(), note } : reset.toISOString()
+  writeOverrides()
+  return { key, value: store[key] }
+}
+
+function deleteManualResetOverride({ backend, accountId, windowType }) {
+  const key = stateKey({ backend, accountId, windowType })
+  const store = readOverrides()
+  const existed = Object.prototype.hasOwnProperty.call(store, key)
+  if (existed) {
+    delete store[key]
+    writeOverrides()
+  }
+  return { key, deleted: existed }
+}
+
+function manualResetAtFor({ backend, accountId, windowType, window }) {
+  if (!window) return null
+  const value = readOverrides()[stateKey({ backend, accountId, windowType })]
+  const resetAt = parseDate(value && typeof value === 'object' ? value.resetAt : value)
+  if (!resetAt) return null
+  if (resetAt < window.start || resetAt > window.end) return null
+  return resetAt
+}
+
+function applyManualResetOverride({ backend, accountId, windowType, window }) {
+  if (!window) return null
+  const manualResetAt = manualResetAtFor({ backend, accountId, windowType, window })
+  if (!manualResetAt) return window
+  const currentResetAt = parseDate(window.quotaResetAt)
+  const effectiveResetAt =
+    currentResetAt && currentResetAt > manualResetAt ? currentResetAt : manualResetAt
+  return {
+    ...window,
+    start: effectiveResetAt > window.start ? effectiveResetAt : window.start,
+    quotaResetAt: effectiveResetAt.toISOString(),
+    quotaResetDetectedBy:
+      currentResetAt && currentResetAt > manualResetAt
+        ? window.quotaResetDetectedBy || null
+        : 'manual_override'
+  }
 }
 
 function setQuotaResetCursor({
@@ -157,6 +247,12 @@ function applyQuotaResetCursor({
   let maxUtilization = finiteNumber(previous && previous.maxUtilization)
   let maxObservedAt = parseDate(previous && previous.maxObservedAt)
   const resetsChanged = previous && materiallyDifferentReset(previous.resetsAt, resetsAtIso)
+
+  if (!ENABLE_UTILIZATION_DROP_RESETS && effectiveResetSource === 'utilization_drop') {
+    effectiveResetAt = null
+    effectiveResetSource = null
+  }
+
   if (resetsChanged) {
     effectiveResetAt = null
     effectiveResetSource = null
@@ -171,7 +267,8 @@ function applyQuotaResetCursor({
   } else if (staleUtilizationAfterReset) {
     if (
       currentUtil === null ||
-      (staleUtilizationValue !== null && currentUtil < staleUtilizationValue - DROP_EPSILON)
+      (staleUtilizationValue !== null &&
+        Math.abs(currentUtil - staleUtilizationValue) > DROP_EPSILON)
     ) {
       staleUtilizationAfterReset = false
       staleUtilizationValue = null
@@ -182,10 +279,10 @@ function applyQuotaResetCursor({
     maxObservedAt = observationTime
   }
 
-  // Sometimes Anthropic resets the 7d quota while the published reset timestamp
-  // does not advance. Only the upstream utilization ratio is trusted here:
-  // usage gaps are not reset evidence. 5h is intentionally ignored.
+  // Utilization drops are noisy for rolling 7d windows, so they are not reset
+  // evidence unless explicitly enabled for a deployment.
   if (
+    ENABLE_UTILIZATION_DROP_RESETS &&
     maxUtilization !== null &&
     !resetsChanged &&
     isSevenDayUtilizationReset(windowType, maxUtilization, currentUtil)
@@ -230,13 +327,18 @@ function applyQuotaResetCursor({
   const effectiveStart =
     effectiveResetAt && effectiveResetAt > window.start ? effectiveResetAt : window.start
 
-  return {
+  return applyManualResetOverride({
+    backend,
+    accountId,
+    windowType,
+    window: {
     ...window,
     start: effectiveStart,
     quotaResetAt: effectiveResetAt ? effectiveResetAt.toISOString() : null,
     quotaResetDetectedBy: effectiveResetSource || null,
     staleUtilizationAfterReset
-  }
+    }
+  })
 }
 
 function utilizationForWindow(utilization, window, observedAt) {
@@ -267,6 +369,10 @@ module.exports = {
   applyQuotaResetCursor,
   getQuotaResetCursor,
   setQuotaResetCursor,
+  applyManualResetOverride,
+  listManualResetOverrides,
+  setManualResetOverride,
+  deleteManualResetOverride,
   utilizationForWindow,
   parseDate
 }

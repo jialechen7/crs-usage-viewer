@@ -21,9 +21,19 @@ crs2 默认关闭;设 `ENABLE_CRS2=true` 并配好 `PG_*` 后才挂载(纯 CRS �
 | GET | `/stats/accounts` | 列出所有账号 |
 | GET | `/stats/account/:name` | 按账号名查该账号下各 key 在 5h/7d 窗口的用量 |
 | GET | `/stats/key/:identifier` | 按 key 名 **或** 原始 token 查该 key 在 5h/7d 窗口的用量 |
+| GET | `/stats/aggregate/account/:name` | 聚合 CRS + CRS2 同名账号,按同名 key 合并后重新计算相对占比 |
 | GET | `/stats/docs` · `/stats/openapi.json` | API 文档(Scalar) |
 
 `/key/:identifier` 自动识别参数;重名时返回数组。
+
+`/stats/aggregate/account/:name` 用于同一个真实账号同时挂在 CRS 和 CRS2 的场景。接口会分别读取两个后端的账号明细,把 5h/7d 成本和 token 相加,再按 key `name` 合并后重新计算:
+
+- 聚合使用名义窗口:5h = reset-5h ~ now,7d = reset-7d ~ now,不使用单平台接口的 reset cursor 裁剪
+- key 名合并大小写不敏感,响应里的 `aliases` 保留原始 key 名
+- `shareOfAccount` = 合并后 key cost / 两个平台账号总 cost
+- `contributionToUtilization` = 共享账号 utilization × `shareOfAccount`
+- 账号级 utilization 不相加,取 `usageUpdatedAt` 最新的非空来源,并在 `utilizationSource` / `utilizationSources` 中返回来源
+- 如果两个平台账号名不一致,可用 `?crsName=...&crs2Name=...` 指定各自名称
 
 > 安全提示:把原始 token 放在 URL 里会落到 nginx access log / Cloudflare 边缘缓存。仅在受控网络内使用。
 
@@ -34,7 +44,18 @@ token 以 `cr_` 开头时按 token 查(需配置 `ENCRYPTION_KEY` 与 CRS 一致
 窗口边界对齐 Anthropic 计费:
 - 5h 窗口 = `claudeFiveHourResetsAt - 5h` ~ now
 - 7d 窗口 = `claudeSevenDayResetsAt - 7d` ~ now
-- 如果 Anthropic 已经重置额度但 reset 时间未推进,服务会把实际统计起点推进到 reset 后或本地检测到的 reset cursor,避免用重置前的用量稀释当前 utilization 占比。
+- 默认只在明确 reset 边界已过时推进统计起点。`utilization` 自然下降/采样抖动不会被当成 reset,避免错误裁短 7d 用量。
+- 如需恢复旧的 utilization-drop 推断,可显式设置 `ENABLE_UTILIZATION_DROP_RESETS=true`。
+- 如果已知某账号真实刷新边界,可在 `.quota-reset-overrides.json` 指定人工边界。格式为 `"<backend>:<accountId>:<windowType>": "<ISO 时间>"`;边界落在名义窗口内才生效,否则忽略。
+- 也可以通过接口设置人工边界。默认不认证;如果配置了 `RESET_OVERRIDE_ADMIN_TOKEN`,写接口需传 `Authorization: Bearer <token>` 或 `x-admin-token`。
+
+```bash
+curl -X PUT http://localhost:3001/stats/reset-overrides/account/Max2 \
+  -H 'content-type: application/json' \
+  -d '{"resetAt":"2026.6.20 00:00:00","windowType":"sevenDay","timezoneOffsetHours":8}'
+
+curl http://localhost:3001/stats/reset-overrides
+```
 
 ### crs2 后端(Postgres / sub2api)
 

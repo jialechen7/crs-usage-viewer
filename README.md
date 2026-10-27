@@ -11,6 +11,18 @@
 
 crs2 默认关闭;设 `ENABLE_CRS2=true` 并配好 `PG_*` 后才挂载(纯 CRS 部署无需安装/连接 Postgres)。
 
+### Magpie 后端
+
+设 `ENABLE_MAGPIE=true`，并将 Magpie 的 `/config` **只读挂载**到 `MAGPIE_DATA_DIR`。只运行 Magpie 时设 `ENABLE_CRS=false`；无需 Redis 或 PostgreSQL。需要 Python 3 和 Node.js 18+。此后端仅读本地 `quotas.json`、`caller-keys.json`、`usage.jsonl` 与价格缓存 `models.json`，不会请求 Anthropic，也不会主动刷新额度。
+
+- `GET /stats/magpie/key`：通过 `Authorization: Bearer <Magpie 网关 key>` 查询该 key，返回与原 `/stats/key` 兼容的数组和 `account`、`fiveHour`、`sevenDay` 字段。密钥不放 URL。禁用或删除的 key 不可访问；设置了模型、账号或预算限制的 key 暂不支持，返回 403，避免扩大可见权限。
+- `GET /stats/magpie/accounts`、`GET /stats/magpie/account/:name`：使用 `MAGPIE_STATS_ADMIN_TOKEN_FILE` 指向文件中的独立管理员 token，Bearer 认证。账号详情返回各 key；未配置管理员 token 时无法访问。
+- `GET /stats/magpie/health`：进程存活检查，不验证本地文件可读性。
+
+`shareOfAccount` 是该 key 的**本地网关估算费用 / 同账号本地网关估算费用**，`contributionToUtilization` 是该比例乘以账号已用额度。价格取自 Magpie 当前本地 Anthropic 模型价格缓存，计算输入、输出和缓存读写，不等于订阅实际账单；网关外的使用不在分母中，额度与 API 费用也未必线性对应。`dataQuality` 提供口径及额度快照时间。用量只统计到快照读取时间，避免用较新的成本分摊较旧额度。快照过期、没有成本、价格缺失或记录损坏时，份额为 `null`，不会伪造 0%。历史价格变化和未记录的请求也可能影响结果。
+
+不要把 `/config` 里的密钥或登录文件公开。对外提供此接口时使用 HTTPS，并限制管理员 token 的持有者；网关 key 仅能查自己的份额。
+
 ## 接口
 
 两个后端各自暴露同一组端点(crs2 把前缀换成 `/stats/crs2`):
